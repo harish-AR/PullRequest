@@ -3,6 +3,7 @@
     <version>47.0</version>
     <types>
         <members>A10</members>
+        <members>A12</members>
         <name>ApexClass</name>
     </types>
 </Package>
