@@ -1,0 +1,444 @@
+package com.rabit.scm;
+
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.List;
+
+import javax.ws.rs.core.MediaType;
+
+import org.apache.log4j.Logger;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import com.google.gson.Gson;
+import com.rabit.admin.Credential;
+import com.rabit.admin.CredentialsController;
+import com.rabit.api.common.RestAPIURIConstants;
+import com.rabit.api.common.RestClientUtil;
+import com.rabit.errorcodes.ErrorMessages;
+import com.rabit.errorcodes.ExceptionCode;
+import com.rabit.main.Messages;
+import com.rabit.scm.beans.PullRequestBean;
+import com.rabit.scm.beans.PullRequestComment;
+import com.rabit.scm.beans.PullRequestCommit;
+import com.rabit.scm.beans.PullRequestDiff;
+import com.rabit.scm.beans.PullRequestHistory;
+import com.rabit.scm.beans.PullRequestRestBean;
+import com.rabit.scm.beans.Repository;
+import com.rabit.scm.beans.RepositoryController;
+import com.rabit.scm.pullrequest.rest.service.impl.PullRequestServiceImpl;
+import com.rabit.service.ws.exception.RabitServicesException;
+import com.rabit.util.DateUtil;
+import com.sun.jersey.api.client.Client;
+import com.sun.jersey.api.client.ClientHandlerException;
+import com.sun.jersey.api.client.ClientResponse;
+import com.sun.jersey.api.client.UniformInterfaceException;
+import com.sun.jersey.api.client.WebResource;
+/**
+ * 
+ * @author MahammadRafiDudekula
+ *
+ */
+public class GitHubPullRequest implements PullRequest {
+	private static final Logger LOG = Logger.getLogger(GitHubPullRequest.class);
+
+	private static final String AUTHORIZATION = "Authorization";
+	private static final String BASIC = "Basic ";
+
+	/**
+	 * Initiate to pull request
+	 */
+	@Override
+	public String createPullRequest(PullRequestBean pullRequestBean, Logger log) throws RabitServicesException {
+		String statusMsg = Messages.CREATED;
+		JSONObject pullRespObj = null;
+		JSONObject errorRespObj = null;
+		log.info("Validating the repo credentials...");
+		if(RestClientUtil.isPullRequestSupported(pullRequestBean.getOrgName(),pullRequestBean.getRepoName()) && isValidRepoCredentials(pullRequestBean)) {
+			try {
+				String pullRequestdata = new Gson().toJson(preparePullRequesRestBean(pullRequestBean));
+				log.info("Validating the repo found in remote as "+pullRequestBean.getActualRepoName());
+				String createPullRequestAPIUrl = RestClientUtil.getPullRequestAPIUrl(pullRequestBean.getOrgName(),pullRequestBean.getRepoName(),pullRequestBean.getPullRequestSCMType())+"/repos/"+pullRequestBean.getLoginName()+"/"+pullRequestBean.getActualRepoName()+"/pulls";
+				ClientResponse postResponse = triggerPostRequest(pullRequestBean, pullRequestdata, createPullRequestAPIUrl);
+				int statusCode = postResponse.getStatus();
+				if(statusCode == 201) {
+					pullRespObj = new JSONObject(postResponse.getEntity(String.class));
+					PullRequestHistory pullRequestHistoryBean = preparePullRequestHistoryBean(pullRespObj, pullRequestBean);
+					//save pullRequestHistoryBean
+					new PullRequestServiceImpl().savePulRequestHistory(pullRequestHistoryBean);
+				}else {
+					log.info("Issue while initiating to pull request");
+					JSONObject jsonObject = new JSONObject(postResponse.getEntity(String.class));
+					JSONArray jsonArray = jsonObject.has("errors") ? jsonObject.getJSONArray("errors") :null;
+					if(jsonArray != null && jsonArray.get(0)!= null) {
+						errorRespObj = (JSONObject) jsonArray.get(0);
+						statusMsg = errorRespObj.has("message") ? errorRespObj.getString("message") : ErrorMessages.PULL_REQUEST_ERROR;
+					}else {
+						statusMsg = ErrorMessages.PULL_REQUEST_ERROR;
+					}
+				}
+				log.info(pullRequestBean.getTitle()+" Pull request found status as " +statusMsg);
+			}catch (JSONException jse) {
+				LOG.error(jse.getMessage());
+				throw new RabitServicesException(ExceptionCode.JSONEXCEPTION.getCode(), jse.getMessage());
+			}
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+		return statusMsg;
+	}
+
+	/**
+	 * To validate repo credentials
+	 */
+	@Override
+	public boolean isValidRepoCredentials(PullRequestBean pullRequestBean) throws RabitServicesException {
+		boolean valid = false;
+		ClientResponse response  = triggerGetRequest(pullRequestBean, RestClientUtil.getPullRequestAPIUrl(pullRequestBean.getOrgName(),pullRequestBean.getRepoName(),pullRequestBean.getPullRequestSCMType())+RestAPIURIConstants.PULL_REQUEST_GET_USER);
+		int statusCode = response.getStatus();
+		if(statusCode == 200) {
+			try {
+				JSONObject userRepoObj = new JSONObject(response.getEntity(String.class));
+				if(userRepoObj != null && userRepoObj.get("login") != null) {
+					valid = true;
+				}
+			} catch (ClientHandlerException | UniformInterfaceException | JSONException e) {
+				LOG.error(e.getMessage());
+				throw new RabitServicesException(e.getMessage(), e.getCause());
+			}
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+		return valid;
+	}
+	private ClientResponse triggerPostRequest(PullRequestBean pullRequestBean, String requestApiData, String apiUrl) {
+		Client client = RestClientUtil.getClient(null,pullRequestBean.getOrgName());
+		WebResource webResource = client.resource(apiUrl);
+		ClientResponse response = webResource.header(AUTHORIZATION, BASIC +RestClientUtil.getBasicAuthToken(pullRequestBean.getLoginName(),pullRequestBean.getPassword())).type(MediaType.APPLICATION_JSON)
+				.accept(MediaType.APPLICATION_JSON).post(ClientResponse.class, requestApiData);
+		return response;
+	}
+	private ClientResponse triggerGetRequest(PullRequestBean pullRequestBean,  String apiUrl) {
+		Client client = RestClientUtil.getClient(null,pullRequestBean.getOrgName());
+		WebResource webResource = client.resource(apiUrl);
+		ClientResponse response = webResource.header(AUTHORIZATION, BASIC +RestClientUtil.getBasicAuthToken(pullRequestBean.getLoginName(),pullRequestBean.getPassword())).type(MediaType.APPLICATION_JSON)
+				.accept(MediaType.APPLICATION_JSON).get(ClientResponse.class);
+		return response;
+	}
+
+	private PullRequestRestBean preparePullRequesRestBean(PullRequestBean pullRequestBean) {
+		PullRequestRestBean restBean = new PullRequestRestBean();
+		RepositoryController rc = new RepositoryController(pullRequestBean.getOrgName(), pullRequestBean.getRepoName());
+		pullRequestBean.setActualRepoName(rc.getActualRemoteRepoName());
+		restBean.setBase(rc.getBranchByName(pullRequestBean.getBase()) != null ? rc.getBranchByName(pullRequestBean.getBase()).getUrl() : pullRequestBean.getBase());
+		restBean.setTitle(pullRequestBean.getTitle());
+		restBean.setHead(pullRequestBean.getLoginName()+":"+rc.getBranchByName(pullRequestBean.getHead()) != null ? rc.getBranchByName(pullRequestBean.getHead()).getUrl() : pullRequestBean.getHead());
+		return restBean;
+	}
+
+	private  PullRequestHistory preparePullRequestHistoryBean(JSONObject pullRespObj, PullRequestBean pullRequestBean) {
+		PullRequestHistory pullRequestHistory = new PullRequestHistory();
+		try {
+			pullRequestHistory.setOrgName(pullRequestBean.getOrgName());
+			pullRequestHistory.setBranchName(pullRequestBean.getHead());
+			pullRequestHistory.setRepoName(pullRequestBean.getRepoName());
+			pullRequestHistory.setCommitedBy(pullRequestBean.getCreatedBy());
+			pullRequestHistory.setTitle(pullRequestBean.getTitle());
+			pullRequestHistory.setBaseBranch(pullRequestBean.getBase());
+			pullRequestHistory.setPullRequestSCMType(pullRequestBean.getPullRequestSCMType());
+			pullRequestHistory.setNumber(pullRespObj.has("number") ? pullRespObj.getInt("number") : 0);
+			pullRequestHistory.setKey(pullRequestBean.getRepoName()+"_"+pullRequestBean.getHead()+"_"+pullRequestHistory.getNumber());//reponame_branch_number
+			pullRequestHistory.setState(pullRespObj.has("state") ? pullRespObj.getString("state") : "open");
+			pullRequestHistory.setMergedStatus(pullRespObj.has("merged") ? pullRespObj.getBoolean("merged"): false);
+			pullRequestHistory.setCreatedDate(DateUtil.getDBUTCDate());
+			pullRequestHistory.setTriggerFrom(pullRequestBean.getTriggeredFrom());
+			if(Messages.PULL_REQUEST_STATE_OPEN.equalsIgnoreCase(pullRequestHistory.getState()) && !pullRequestHistory.isMergedStatus()) {
+				pullRequestHistory.setPullRequestStatus(Messages.PULL_REQUEST_STATE_OPEN);
+			}else if(Messages.PULL_REQUEST_STATE_CLOSE.equalsIgnoreCase(pullRequestHistory.getState()) && pullRequestHistory.isMergedStatus()) {
+				pullRequestHistory.setPullRequestStatus(Messages.PULL_REQUEST_STATE_MERGED);
+			}else if(Messages.PULL_REQUEST_STATE_CLOSE.equalsIgnoreCase(pullRequestHistory.getState()) && !pullRequestHistory.isMergedStatus()) {
+				pullRequestHistory.setPullRequestStatus(Messages.PULL_REQUEST_STATE_CLOSE);
+			}
+			pullRequestHistory.setCommentsCount(pullRespObj.has("comments") ? pullRespObj.getInt("comments"): 0);
+			pullRequestHistory.setCommitsCount(pullRespObj.has("commits") ? pullRespObj.getInt("commits"): 0);
+			
+		} catch (JSONException e) {
+			LOG.error(e.getMessage());
+		}
+		return pullRequestHistory;
+	}
+	
+	public PullRequestBean getPullRequestBean(PullRequestHistory pullReqHistory, String userID) throws RabitServicesException {
+		PullRequestBean pullRequestBean  = new PullRequestBean();
+		pullRequestBean.setOrgName(pullReqHistory.getOrgName());
+		RepositoryController rc = new RepositoryController(pullReqHistory.getOrgName(),pullReqHistory.getRepoName());
+		Credential credential = null;
+		CredentialsController credentialsController = new CredentialsController(pullReqHistory.getOrgName(), null,true ,null);
+		Repository repository = rc.getRepository();
+		if (repository != null) {
+			credential = credentialsController.getUserCredentials(repository, pullReqHistory.getOrgName(), userID, pullReqHistory.getBranchName(), null);
+			if(credential != null) {
+				pullRequestBean.setLoginName(credential.getUserName());
+				pullRequestBean.setPassword(credential.getPassword());
+				pullRequestBean.setActualRepoName(rc.getActualRemoteRepoName());
+			} else {
+				LOG.error("Credentials not found ");
+				throw new RabitServicesException(ExceptionCode.PARSEREXCEPTION.getCode(), "You dont have permission to Credential: " + repository.getAccessKey());
+			}
+		}
+		return pullRequestBean;
+	}
+	@Override
+	public void getUpdatedPullRequestDetails(PullRequestHistory pullReqHistory, String userID) throws RabitServicesException {
+		PullRequestBean pullRequestBean  = getPullRequestBean(pullReqHistory, userID);
+		String singlePullRequestAPIUrl = RestClientUtil.getPullRequestAPIUrl(pullReqHistory.getOrgName(),pullReqHistory.getRepoName(),pullReqHistory.getPullRequestSCMType())+"/repos/"+pullRequestBean.getLoginName()+"/"+pullRequestBean.getActualRepoName()+"/pulls/"+pullReqHistory.getNumber();
+		ClientResponse response  = triggerGetRequest(pullRequestBean, singlePullRequestAPIUrl);
+		int statusCode = response.getStatus();
+		if(statusCode == 200) {
+			try {
+				JSONObject pullRespObj = new JSONObject(response.getEntity(String.class));
+				if(pullRespObj != null && pullRespObj.has("user")) {
+					pullReqHistory.setTitle(pullRespObj.has("title") ? pullRespObj.getString("title") : "");
+					pullReqHistory.setState(pullRespObj.has("state") ? pullRespObj.getString("state") : "open");
+					pullReqHistory.setMergedStatus(pullRespObj.has("merged") ? pullRespObj.getBoolean("merged"): false);
+					JSONArray jsonArray = pullRespObj.has("assignees") ? pullRespObj.getJSONArray("assignees") : new JSONArray() ;
+					List <String> assignList = new ArrayList<>();
+					JSONObject jSONObject  = new JSONObject();
+					for(int i = 0; i < jsonArray.length(); i++){
+						jSONObject = jsonArray.getJSONObject(i);
+						assignList.add(jSONObject.has("login") ? (String) jSONObject.get("login") : "");
+					}
+					if(!assignList.isEmpty()) {
+						pullReqHistory.setAssignees(assignList);
+					}
+					if(Messages.PULL_REQUEST_STATE_OPEN.equalsIgnoreCase(pullReqHistory.getState()) && !pullReqHistory.isMergedStatus()) {
+						pullReqHistory.setPullRequestStatus(Messages.PULL_REQUEST_STATE_OPEN);
+					}else if(Messages.PULL_REQUEST_STATE_CLOSE.equalsIgnoreCase(pullReqHistory.getState()) && pullReqHistory.isMergedStatus()) {
+						pullReqHistory.setPullRequestStatus(Messages.PULL_REQUEST_STATE_MERGED);
+					}else if(Messages.PULL_REQUEST_STATE_CLOSE.equalsIgnoreCase(pullReqHistory.getState()) && !pullReqHistory.isMergedStatus()) {
+						pullReqHistory.setPullRequestStatus(Messages.PULL_REQUEST_STATE_CLOSE);
+					}
+					pullReqHistory.setCommentsCount(pullRespObj.has("comments") ? pullRespObj.getInt("comments"): 0);
+					pullReqHistory.setCommitsCount(pullRespObj.has("commits") ? pullRespObj.getInt("commits"): 0);
+					new PullRequestServiceImpl().savePulRequestHistory(pullReqHistory);
+				}
+			} catch (ClientHandlerException | UniformInterfaceException | JSONException e) {
+				LOG.error(e.getMessage());
+				throw new RabitServicesException(e.getMessage(), e.getCause());
+			}
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+	}
+	@Override
+	public List<PullRequestComment> getPullRequestComments(PullRequestHistory pullReqHistory, String userID) throws RabitServicesException {
+		List<PullRequestComment> pullRequestComments = new ArrayList<>();
+		PullRequestBean pullRequestBean  = getPullRequestBean(pullReqHistory, userID);
+		String commentsPullRequestAPIUrl = RestClientUtil.getPullRequestAPIUrl(pullReqHistory.getOrgName(),pullReqHistory.getRepoName(),pullReqHistory.getPullRequestSCMType())+"/repos/"+pullRequestBean.getLoginName()+"/"+pullRequestBean.getActualRepoName()+"/issues/"+pullReqHistory.getNumber()+"/comments";
+		ClientResponse response  = triggerGetRequest(pullRequestBean, commentsPullRequestAPIUrl);
+		int statusCode = response.getStatus();
+		if(statusCode == 200) {
+			try {
+					JSONArray jsonArr = new JSONArray(response.getEntity(String.class));
+					 JSONObject jsonObj = new  JSONObject();
+					 for (int i = 0; i < jsonArr.length(); i++){
+						 jsonObj = jsonArr.getJSONObject(i);
+						 if(jsonObj != null) {
+							 PullRequestComment comment = new PullRequestComment();
+							 comment.setTitle(jsonObj.has("body") ? jsonObj.getString("body") : "");
+							 comment.setCommentDate(jsonObj.has("updated_at") ? DateUtil.getDBUTCDate(jsonObj.getString("updated_at"), new SimpleDateFormat(DateUtil.ISO_DATE_PATTERN), new SimpleDateFormat(DateUtil.DB_DATETIME_PATTERN)) : "");
+							 JSONObject userObj = jsonObj.has("user") ? jsonObj.getJSONObject("user") : null;
+							 if(userObj != null) {
+								 comment.setCommentBy(userObj.has("login") ? userObj.getString("login") : "");
+							 }
+							 pullRequestComments.add(comment);
+						 }
+					 }
+				return pullRequestComments;
+			} catch (ClientHandlerException | UniformInterfaceException | JSONException e) {
+				LOG.error(e.getMessage());
+				throw new RabitServicesException(e.getMessage(), e.getCause());
+			}
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+	}
+	@Override
+	public List<PullRequestCommit> getPullRequestCommits(PullRequestHistory pullReqHistory, String userID) throws RabitServicesException {
+		List<PullRequestCommit> pullRequestCommits = new ArrayList<>();
+		PullRequestBean pullRequestBean  = getPullRequestBean(pullReqHistory, userID);
+		String commitsPullRequestAPIUrl = RestClientUtil.getPullRequestAPIUrl(pullReqHistory.getOrgName(),pullReqHistory.getRepoName(),pullReqHistory.getPullRequestSCMType())+"/repos/"+pullRequestBean.getLoginName()+"/"+pullRequestBean.getActualRepoName()+"/pulls/"+pullReqHistory.getNumber()+"/commits";
+		ClientResponse response  = triggerGetRequest(pullRequestBean, commitsPullRequestAPIUrl);
+		int statusCode = response.getStatus();
+		if(statusCode == 200) {
+			try {
+				JSONArray jsonArr = new JSONArray(response.getEntity(String.class));
+					 JSONObject jsonObj = new JSONObject();
+					 JSONObject commitJsonObj = new JSONObject();
+					 JSONObject autherJsonObj = new JSONObject();
+					 for (int i = 0; i < jsonArr.length(); i++){
+						 jsonObj = jsonArr.getJSONObject(i);
+						 if(jsonObj != null && jsonObj.has("sha")) {
+							 PullRequestCommit commit = new PullRequestCommit();
+							 commit.setRevisionNo(!jsonObj.getString("sha").isEmpty() && jsonObj.getString("sha").length() >= GitShortShaUtil.getShortSha(pullReqHistory.getOrgName()) ? jsonObj.getString("sha").substring(0, GitShortShaUtil.getShortSha(pullReqHistory.getOrgName())): "");
+							 commitJsonObj = jsonObj.getJSONObject("commit");
+							 if(commitJsonObj != null) {
+								 commit.setTitle(commitJsonObj.has("message") ? commitJsonObj.getString("message") : "");
+							 }
+							 autherJsonObj = commitJsonObj.getJSONObject("author");
+							 if(autherJsonObj != null) {
+								 commit.setCommitedBy(autherJsonObj.has("name") ? autherJsonObj.getString("name") : "");
+								 commit.setCommitedDate(autherJsonObj.has("date") ? DateUtil.getDBUTCDate(autherJsonObj.getString("date"), new SimpleDateFormat(DateUtil.ISO_DATE_PATTERN), new SimpleDateFormat(DateUtil.DB_DATETIME_PATTERN)) : "");
+							 }
+							 pullRequestCommits.add(commit);
+						 }
+					 }
+				return pullRequestCommits;
+			} catch (ClientHandlerException | UniformInterfaceException | JSONException e) {
+				LOG.error(e.getMessage());
+				throw new RabitServicesException(e.getMessage(), e.getCause());
+			}
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+		
+	}
+	@Override
+	public List<PullRequestDiff> getPullRequestDffs(PullRequestHistory pullReqHistory, String userID) throws RabitServicesException {
+		List<PullRequestDiff> pullRequestDiff = new ArrayList<>();
+		PullRequestBean pullRequestBean  = getPullRequestBean(pullReqHistory, userID);
+		String commentsPullRequestAPIUrl = RestClientUtil.getPullRequestAPIUrl(pullReqHistory.getOrgName(),pullReqHistory.getRepoName(),pullReqHistory.getPullRequestSCMType())+"/repos/"+pullRequestBean.getLoginName()+"/"+pullRequestBean.getActualRepoName()+"/pulls/"+pullReqHistory.getNumber()+"/files";
+		ClientResponse response  = triggerGetRequest(pullRequestBean, commentsPullRequestAPIUrl);
+		int statusCode = response.getStatus();
+		if(statusCode == 200) {
+			try {
+				JSONArray jsonArr = new JSONArray(response.getEntity(String.class));
+					 JSONObject jsonObj = new  JSONObject();
+					 for (int i = 0; i < jsonArr.length(); i++){
+						 jsonObj = jsonArr.getJSONObject(i);
+						 if(jsonObj != null) {
+							 PullRequestDiff diffFile = new PullRequestDiff();
+							 diffFile.setRevisionNo(!jsonObj.getString("sha").isEmpty() && jsonObj.getString("sha").length() >= GitShortShaUtil.getShortSha(pullReqHistory.getOrgName()) ? jsonObj.getString("sha").substring(0, GitShortShaUtil.getShortSha(pullReqHistory.getOrgName())): "");
+							 diffFile.setFileName(jsonObj.has("filename") ? jsonObj.getString("filename") : "");
+							 diffFile.setStatus(jsonObj.has("status") ? jsonObj.getString("status") : "");
+							 diffFile.setAdditions(jsonObj.has("additions") ? jsonObj.getInt("additions") : 0);
+							 diffFile.setChanges(jsonObj.has("changes") ? jsonObj.getInt("changes") : 0);
+							 diffFile.setDeletions(jsonObj.has("deletions") ? jsonObj.getInt("deletions") : 0);
+							 diffFile.setFileContent(jsonObj.has("patch") ? jsonObj.getString("patch") : "");
+							 pullRequestDiff.add(diffFile);
+						 }
+					 }
+				return pullRequestDiff;
+			} catch (ClientHandlerException | UniformInterfaceException | JSONException e) {
+				LOG.error(e.getMessage());
+				throw new RabitServicesException(e.getMessage(), e.getCause());
+			}
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+		
+	}
+	
+	@Override
+	public List<PullRequestDiff> getPullRequestRevisionDffs(PullRequestHistory pullReqHistory, String userID, String revisionNo) throws RabitServicesException {
+		List<PullRequestDiff> pullRequestDiff = new ArrayList<>();
+		PullRequestBean pullRequestBean  = getPullRequestBean(pullReqHistory, userID);
+		String commentsPullRequestAPIUrl = RestClientUtil.getPullRequestAPIUrl(pullReqHistory.getOrgName(),pullReqHistory.getRepoName(),pullReqHistory.getPullRequestSCMType())+"/repos/"+pullRequestBean.getLoginName()+"/"+pullRequestBean.getActualRepoName()+"/commits/"+revisionNo.trim();
+		ClientResponse response  = triggerGetRequest(pullRequestBean, commentsPullRequestAPIUrl);
+		int statusCode = response.getStatus();
+		if(statusCode == 200) {
+			try {
+				JSONObject revisionObj = new JSONObject(response.getEntity(String.class));
+				
+				if(revisionObj != null && revisionObj.has("sha")) {
+					JSONArray jsonArray = revisionObj.has("files") ? revisionObj.getJSONArray("files") : new JSONArray() ;
+					 JSONObject jsonObj = new  JSONObject();
+					 for (int i = 0; i < jsonArray.length(); i++){
+						 jsonObj = jsonArray.getJSONObject(i);
+						 if(jsonObj != null) {
+							 PullRequestDiff diffFile = new PullRequestDiff();
+							 diffFile.setRevisionNo(!jsonObj.getString("sha").isEmpty() && jsonObj.getString("sha").length() >= GitShortShaUtil.getShortSha(pullReqHistory.getOrgName()) ? jsonObj.getString("sha").substring(0, GitShortShaUtil.getShortSha(pullReqHistory.getOrgName())): "");
+							 diffFile.setFileName(jsonObj.has("filename") ? jsonObj.getString("filename") : "");
+							 diffFile.setStatus(jsonObj.has("status") ? jsonObj.getString("status") : "");
+							 diffFile.setAdditions(jsonObj.has("additions") ? jsonObj.getInt("additions") : 0);
+							 diffFile.setChanges(jsonObj.has("changes") ? jsonObj.getInt("changes") : 0);
+							 diffFile.setDeletions(jsonObj.has("deletions") ? jsonObj.getInt("deletions") : 0);
+							 diffFile.setFileContent(jsonObj.has("patch") ? jsonObj.getString("patch") : "");
+							 pullRequestDiff.add(diffFile);
+						 }
+					 }
+				}
+				return pullRequestDiff;
+			} catch (ClientHandlerException | UniformInterfaceException | JSONException e) {
+				LOG.error(e.getMessage());
+				throw new RabitServicesException(e.getMessage(), e.getCause());
+			}
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+		
+	}
+	
+	@Override
+	public String updatePullRequestComment(PullRequestBean pullRequestBean, Logger log) throws RabitServicesException {
+		String statusMsg ="";
+		log.info("Validating the repo credentials and pull request support...");
+		if(RestClientUtil.isPullRequestSupported(pullRequestBean.getOrgName(),pullRequestBean.getRepoName())) {
+			String pullRequestdata = "{\r\n" + 
+					"\"body\": \""+pullRequestBean.getBody()+"\"\r\n" + 
+					"}";
+			log.info("Validating the repo found in remote as "+pullRequestBean.getActualRepoName());
+			String updateCommentPullRequestAPIUrl = RestClientUtil.getPullRequestAPIUrl(pullRequestBean.getOrgName(),pullRequestBean.getRepoName(),pullRequestBean.getPullRequestSCMType())+"/repos/"+pullRequestBean.getLoginName()+"/"+pullRequestBean.getActualRepoName()+"/issues/"+pullRequestBean.getNumber()+"/comments";
+			ClientResponse postResponse = triggerPostRequest(pullRequestBean, pullRequestdata, updateCommentPullRequestAPIUrl);
+			int statusCode = postResponse.getStatus();
+			if(statusCode == 201) {
+				statusMsg = Messages.SUCCESS;
+			}else {
+				statusMsg = Messages.FAILED;
+			}
+			log.info(pullRequestBean.getBody()+" comment update as " +statusMsg);
+		}else {
+			throw new RabitServicesException(ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getCode(),ExceptionCode.REMOTEAUTHENTICATIONEXCEPTION.getDescription());
+		}
+		return statusMsg;
+
+	}
+	@Override
+	public boolean testPullRequestSupportOnRepo(PullRequestBean pullRequestBean,  String apiUrl) {
+		boolean status = false;
+		Client client = RestClientUtil.getClient(null,pullRequestBean.getOrgName());
+		WebResource webResource = client.resource(apiUrl);
+		ClientResponse response = webResource.header(AUTHORIZATION, BASIC +RestClientUtil.getBasicAuthToken(pullRequestBean.getLoginName(),pullRequestBean.getPassword())).type(MediaType.APPLICATION_JSON)
+				.accept(MediaType.APPLICATION_JSON).get(ClientResponse.class);
+		int statusCode = response.getStatus();
+		if(statusCode == 200) {
+			status = true;
+		}
+		return status;
+	}
+	
+	public static void main(String[] args) {
+		GitHubPullRequest gitHubPullRequest = new GitHubPullRequest();
+		try {
+			PullRequestBean pullRequestBean =  new PullRequestBean();
+			//pullRequestBean.setActualRepoName("PullReqs-Test");
+			pullRequestBean.setLoginName("harish-AR");
+			pullRequestBean.setPassword("Rabit@123");
+			pullRequestBean.setBase("master");
+			pullRequestBean.setHead("hrbr1");
+			pullRequestBean.setTitle("multi req NEW 1");
+			pullRequestBean.setBody("comment NEW 1");
+			pullRequestBean.setPullRequestSCMType("github");
+			pullRequestBean.setRepoName("gibpullrqst");
+			pullRequestBean.setCreatedBy("mahesh.k@autorabit.com");
+			//pullRequestBean.setBranchName(branchName);
+			pullRequestBean.setTriggeredFrom("API");
+			pullRequestBean.setOrgName("autorabit.com-W6d1rU");
+			//System.out.println(gitHubPullRequest.isValidRepoCredentials(pullRequestBean));
+			gitHubPullRequest.createPullRequest(pullRequestBean, LOG);
+		} catch (RabitServicesException e) {
+			e.printStackTrace();
+		}
+	}
+}
