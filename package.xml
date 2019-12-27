@@ -2,6 +2,8 @@
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
     <version>47.0</version>
     <types>
+        <members>A000</members>
+        <members>A012</members>
         <members>A10</members>
         <members>A12</members>
         <name>ApexClass</name>
